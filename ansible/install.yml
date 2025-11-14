@@ -1,0 +1,142 @@
+---
+# Ansible playbook to install claude-review to user space
+# Usage: ansible-playbook install.yml
+# Installs to ~/.local/bin (no sudo required)
+
+- name: Install claude-review tool
+  hosts: all
+  vars:
+    script_name: claude-review
+    # Tmux configuration - customize these before running
+    tmux_enable: true                    # Set to false to skip tmux configuration
+    tmux_keybinding: "r"                 # Key to bind (prefix + this key)
+    tmux_popup_width: "80%"              # Popup window width
+    tmux_popup_height: "75%"             # Popup window height
+
+  tasks:
+    - name: Get user home directory
+      set_fact:
+        user_home: "{{ ansible_env.HOME }}"
+        install_dir: "{{ ansible_env.HOME }}/.local/bin"
+        repo_root: "{{ playbook_dir | dirname }}"
+
+    - name: Check if git is installed
+      command: which git
+      register: git_check
+      failed_when: false
+      changed_when: false
+
+    - name: Verify git is available
+      fail:
+        msg: "Git is not installed. Please install git first."
+      when: git_check.rc != 0
+
+    - name: Check if claude CLI is installed
+      command: which claude
+      register: claude_check
+      failed_when: false
+      changed_when: false
+
+    - name: Warn if claude CLI is not found
+      debug:
+        msg: "WARNING: Claude CLI not found in PATH. Install it from https://claude.ai/download"
+      when: claude_check.rc != 0
+
+    - name: Ensure installation directory exists
+      file:
+        path: "{{ install_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Create symlink for claude-review script
+      file:
+        src: "{{ repo_root }}/src/{{ script_name }}"
+        dest: "{{ install_dir }}/{{ script_name }}"
+        state: link
+        force: yes
+      notify: Verify installation
+
+    # Tmux integration tasks
+    - name: Create symlink for claude-review-tmux wrapper
+      file:
+        src: "{{ repo_root }}/src/{{ script_name }}-tmux"
+        dest: "{{ install_dir }}/{{ script_name }}-tmux"
+        state: link
+        force: yes
+      when: tmux_enable | bool
+    - name: Check if tmux is installed
+      command: which tmux
+      register: tmux_check
+      failed_when: false
+      changed_when: false
+      when: tmux_enable | bool
+
+    - name: Ensure tmux config file exists
+      file:
+        path: "{{ user_home }}/.tmux.conf"
+        state: touch
+        mode: '0644'
+        modification_time: preserve
+        access_time: preserve
+      when: tmux_enable | bool and tmux_check.rc == 0
+
+    - name: Add claude-review keybinding to tmux config
+      blockinfile:
+        path: "{{ user_home }}/.tmux.conf"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - claude-review"
+        block: |
+          # claude-review integration - AI-assisted code review in tmux popup
+          # Trigger with prefix + {{ tmux_keybinding }}
+          # Creates or attaches to a named session in a popup window
+          bind-key {{ tmux_keybinding }} run-shell "{{ install_dir }}/{{ script_name }}-tmux '#{pane_current_path}'"
+        create: yes
+      when: tmux_enable | bool and tmux_check.rc == 0
+      notify: Reload tmux config
+
+    - name: Display tmux integration info
+      debug:
+        msg: "Tmux integration configured! Use prefix + {{ tmux_keybinding }} to run claude-review in a named window"
+      when: tmux_enable | bool and tmux_check.rc == 0
+
+    - name: Tmux not found warning
+      debug:
+        msg: "Tmux is not installed. Skipping tmux integration. Install tmux and re-run to enable popup support."
+      when: tmux_enable | bool and tmux_check.rc != 0
+
+  handlers:
+    - name: Verify installation
+      command: "{{ install_dir }}/{{ script_name }} --version"
+      register: version_check
+      failed_when: false
+      changed_when: false
+
+    - name: Display installation result
+      debug:
+        msg: "Installation successful! Run 'claude-review --help' to get started."
+      when: version_check.rc == 0
+
+    - name: Reload tmux config
+      shell: |
+        if tmux info &> /dev/null; then
+          tmux source-file {{ user_home }}/.tmux.conf
+          echo "Tmux config reloaded"
+        else
+          echo "Tmux not running, config will be loaded on next tmux start"
+        fi
+      register: tmux_reload
+      changed_when: false
+
+    - name: Display tmux reload result
+      debug:
+        msg: "{{ tmux_reload.stdout }}"
+
+    - name: Check if ~/.local/bin is in PATH
+      shell: echo "$PATH" | grep -q "$HOME/.local/bin"
+      register: path_check
+      failed_when: false
+      changed_when: false
+
+    - name: Display PATH warning if needed
+      debug:
+        msg: "WARNING: {{ install_dir }} is not in your PATH. Add 'export PATH=\"$HOME/.local/bin:$PATH\"' to your ~/.bashrc or ~/.zshrc"
+      when: path_check.rc != 0

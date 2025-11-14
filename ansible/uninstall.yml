@@ -1,0 +1,75 @@
+---
+# Ansible playbook to uninstall claude-review from user space
+# Usage: ansible-playbook uninstall.yml
+# Removes from ~/.local/bin (no sudo required)
+
+- name: Uninstall claude-review tool
+  hosts: all
+  vars:
+    script_name: claude-review
+
+  tasks:
+    - name: Get user home directory
+      set_fact:
+        user_home: "{{ ansible_env.HOME }}"
+        install_dir: "{{ ansible_env.HOME }}/.local/bin"
+    - name: Check if claude-review is installed
+      stat:
+        path: "{{ install_dir }}/{{ script_name }}"
+      register: script_stat
+
+    - name: Remove claude-review script
+      file:
+        path: "{{ install_dir }}/{{ script_name }}"
+        state: absent
+      when: script_stat.stat.exists
+      notify: Confirm uninstall
+
+    - name: Script not found
+      debug:
+        msg: "claude-review is not installed at {{ install_dir }}/{{ script_name }}"
+      when: not script_stat.stat.exists
+
+    - name: Remove claude-review-tmux wrapper
+      file:
+        path: "{{ install_dir }}/{{ script_name }}-tmux"
+        state: absent
+
+    # Tmux cleanup
+    - name: Check if tmux config exists
+      stat:
+        path: "{{ user_home }}/.tmux.conf"
+      register: tmux_conf_stat
+
+    - name: Remove claude-review keybinding from tmux config
+      blockinfile:
+        path: "{{ user_home }}/.tmux.conf"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - claude-review"
+        state: absent
+      when: tmux_conf_stat.stat.exists
+      notify: Reload tmux after uninstall
+
+    - name: Display tmux cleanup info
+      debug:
+        msg: "Removed claude-review tmux keybinding from ~/.tmux.conf"
+      when: tmux_conf_stat.stat.exists
+
+  handlers:
+    - name: Confirm uninstall
+      debug:
+        msg: "claude-review has been successfully uninstalled"
+
+    - name: Reload tmux after uninstall
+      shell: |
+        if tmux info &> /dev/null; then
+          tmux source-file {{ user_home }}/.tmux.conf
+          echo "Tmux config reloaded"
+        else
+          echo "Tmux not running, changes will apply on next start"
+        fi
+      register: tmux_reload_uninstall
+      changed_when: false
+
+    - name: Display tmux reload result
+      debug:
+        msg: "{{ tmux_reload_uninstall.stdout }}"
