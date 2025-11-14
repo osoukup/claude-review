@@ -1,0 +1,76 @@
+#!/bin/bash
+
+# claude-review-tmux - Smart tmux popup integration for claude-review
+# Creates or attaches to a named session within a popup window
+
+set -uo pipefail
+
+# Get the initial directory (passed from tmux keybinding)
+script_initial_dir="${1:-$(pwd)}"
+
+# Define session suffix and max length
+session_suffix="-claude-review"
+max_total_session_length=20
+max_base_name_length=$((max_total_session_length - ${#session_suffix}))
+
+# Attempt to find the Git repository root
+git_root=""
+is_in_git_repo=false
+
+# Check if git exists and initial directory is valid
+if command -v git &> /dev/null && [ -d "$script_initial_dir" ]; then
+    temp_git_root_output=$(
+        sh -c "
+            set -euo pipefail
+            if cd \"$script_initial_dir\" 2>/dev/null; then
+                if git rev-parse --is-inside-work-tree &>/dev/null; then
+                    git rev-parse --show-toplevel
+                fi
+            fi
+        " 2>/dev/null || true
+    )
+
+    if [[ -n "$temp_git_root_output" ]]; then
+        git_root="$temp_git_root_output"
+        is_in_git_repo=true
+    fi
+fi
+
+# Determine the base name for the session
+session_base_name=""
+if $is_in_git_repo; then
+    session_base_name=$(basename "$git_root")
+else
+    session_base_name=$(basename "$script_initial_dir")
+fi
+
+# Shorten session name if too long
+if (( ${#session_base_name} > max_base_name_length )); then
+    truncated_length=$((max_base_name_length - 3))
+    if (( truncated_length < 1 )); then
+        truncated_length=1
+    fi
+    session_base_name="${session_base_name:0:$truncated_length}..."
+fi
+
+# Construct the full session name
+session_name="${session_base_name}${session_suffix}"
+
+# Determine the directory where the session should start
+initial_session_dir=""
+if $is_in_git_repo; then
+    initial_session_dir="$git_root"
+else
+    initial_session_dir="$script_initial_dir"
+fi
+
+# Popup dimensions (can be overridden by environment variables)
+popup_width="${CLAUDE_REVIEW_POPUP_WIDTH:-80%}"
+popup_height="${CLAUDE_REVIEW_POPUP_HEIGHT:-75%}"
+
+# Core command for the session - runs claude-review
+# Add pause at the end so user can read the results before closing
+core_session_command="tmux new-session -A -D -s \"${session_name}\" -c \"${initial_session_dir}\" \"claude-review; echo ''; read -p 'Press Enter to close...'\""
+
+# Launch popup with the session
+tmux display-popup -E -w "$popup_width" -h "$popup_height" -x C -y C -d "${initial_session_dir}" "${core_session_command}"
