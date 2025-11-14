@@ -1,0 +1,315 @@
+#!/bin/bash
+
+# claude-review - AI-assisted code review tool using Claude CLI
+# This tool analyzes git commits for potential issues and provides recommendations
+
+set -e
+
+# Detect if output is to a terminal (TTY)
+# If not (piped/redirected), disable colors and fancy output
+if [ -t 1 ]; then
+    IS_TTY=true
+    # Colors for output
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    BOLD='\033[1m'
+    NC='\033[0m' # No Color
+else
+    IS_TTY=false
+    # No colors when piped/redirected
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    BOLD=''
+    NC=''
+fi
+
+# Default values
+BASE_BRANCH=""
+DRY_RUN=true
+
+# Function to print progress/status messages
+# When output is piped, these go to stderr so they don't pollute the output
+print_status() {
+    if [ "$IS_TTY" = true ]; then
+        echo -e "$@"
+    else
+        echo -e "$@" >&2
+    fi
+}
+
+# Function to print usage
+usage() {
+    cat << EOF
+Usage: claude-review [OPTIONS]
+
+AI-assisted code review tool that analyzes commits since the base branch.
+
+OPTIONS:
+    -b, --base-branch BRANCH    Specify base branch (default: auto-detect main/master)
+    -h, --help                  Show this help message
+    --version                   Show version information
+
+EXAMPLES:
+    claude-review                      # Review changes since main/master
+    claude-review -b develop           # Review changes since develop branch
+
+NOTE: This tool runs in read-only mode and only provides recommendations.
+EOF
+    exit 0
+}
+
+# Function to print version
+version() {
+    echo "claude-review 0.1.0"
+    exit 0
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -b|--base-branch)
+            BASE_BRANCH="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        --version)
+            version
+            ;;
+        *)
+            echo "Unknown option: $1"
+            usage
+            ;;
+    esac
+done
+
+# Check if we're in a git repository
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    echo -e "${RED}Error: Not a git repository${NC}" >&2
+    exit 1
+fi
+
+# Check if claude CLI is available
+if ! command -v claude &> /dev/null; then
+    echo -e "${RED}Error: Claude CLI is not installed or not in PATH${NC}" >&2
+    echo "Please install Claude CLI first: https://claude.ai/download" >&2
+    exit 1
+fi
+
+# Auto-detect base branch if not specified
+if [ -z "$BASE_BRANCH" ]; then
+    if git show-ref --verify --quiet refs/heads/main; then
+        BASE_BRANCH="main"
+    elif git show-ref --verify --quiet refs/heads/master; then
+        BASE_BRANCH="master"
+    else
+        echo -e "${RED}Error: Could not auto-detect base branch (main/master)${NC}" >&2
+        echo "Please specify base branch with -b option" >&2
+        exit 1
+    fi
+fi
+
+# Verify base branch exists
+if ! git show-ref --verify --quiet refs/heads/$BASE_BRANCH; then
+    echo -e "${RED}Error: Base branch '$BASE_BRANCH' does not exist${NC}" >&2
+    exit 1
+fi
+
+# Get current branch name
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+# Check if there are any commits to review
+if ! git rev-list $BASE_BRANCH..HEAD &> /dev/null; then
+    echo -e "${YELLOW}Warning: Could not determine commits between $BASE_BRANCH and HEAD${NC}" >&2
+    exit 1
+fi
+
+COMMIT_COUNT=$(git rev-list --count $BASE_BRANCH..HEAD)
+
+if [ "$COMMIT_COUNT" -eq 0 ]; then
+    print_status "${GREEN}No new commits to review since $BASE_BRANCH${NC}"
+    exit 0
+fi
+
+# Show decorative header only when outputting to terminal
+if [ "$IS_TTY" = true ]; then
+    echo -e "${BLUE}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║          AI-Assisted Code Review with Claude               ║${NC}"
+    echo -e "${BLUE}╚════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${BLUE}Base branch:${NC}     $BASE_BRANCH"
+    echo -e "${BLUE}Current branch:${NC}  $CURRENT_BRANCH"
+    echo -e "${BLUE}Commits:${NC}         $COMMIT_COUNT"
+    echo ""
+fi
+
+# Get the diff
+print_status "${BLUE}Extracting changes...${NC}"
+DIFF=$(git diff $BASE_BRANCH..HEAD)
+
+if [ -z "$DIFF" ]; then
+    print_status "${YELLOW}No changes found between $BASE_BRANCH and HEAD${NC}"
+    exit 0
+fi
+
+# Get commit messages for context
+COMMITS=$(git log $BASE_BRANCH..HEAD --pretty=format:"- %h: %s")
+
+# Create temporary file for the prompt
+PROMPT_FILE=$(mktemp)
+trap "rm -f $PROMPT_FILE" EXIT
+
+# Create the review prompt with actual content
+cat > "$PROMPT_FILE" << PROMPT_START
+You are an expert code reviewer. Please analyze the following git diff and provide a critical code review.
+
+Focus on:
+1. **Functional Issues**: Logic errors, bugs, edge cases, incorrect implementations
+2. **Performance Issues**: Inefficient algorithms, memory leaks, unnecessary computations
+3. **Security Issues**: SQL injection, XSS, authentication/authorization flaws, data exposure, input validation
+4. **Code Quality**: Maintainability, readability, best practices, code smells
+
+Commit messages:
+$COMMITS
+
+Changes to review:
+\`\`\`diff
+$DIFF
+\`\`\`
+
+Please provide your review in the following format:
+
+## Summary
+[Brief 1-2 sentence overview of the changes]
+
+## Issues Found
+
+### Critical Issues
+[List any critical issues with file:line references, or "None" if no critical issues]
+
+### Warnings
+[List any non-critical but important issues with file:line references, or "None" if no warnings]
+
+### Suggestions
+[List any minor improvements or style suggestions, or "None" if no suggestions]
+
+## Recommendation
+Based on the analysis, provide ONE of these recommendations:
+- **REJECT**: Critical issues found that must be fixed before merging
+- **POLISH**: Non-critical issues found; author should review but can decide whether to merge
+- **ACCEPT**: Changes look good with no significant issues
+
+[Provide brief justification for your recommendation]
+PROMPT_START
+
+# Function to show a spinner while waiting
+show_spinner() {
+    local pid=$1
+    local delay=0.1
+    local spinstr='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local temp
+    local i=0
+
+    # Hide cursor
+    tput civis 2>/dev/null || true
+
+    while kill -0 "$pid" 2>/dev/null; do
+        i=$(( (i+1) %10 ))
+        printf "\r\033[0;34m %s \033[0m Analyzing changes with Claude...   " "${spinstr:$i:1}"
+        sleep $delay
+    done
+
+    # Clear the line and show cursor
+    printf "\r%60s\r" " "
+    tput cnorm 2>/dev/null || true
+}
+
+# Function to format markdown output with colors
+format_output() {
+    local output="$1"
+
+    # Check if glow is available for better markdown rendering
+    if command -v glow &> /dev/null; then
+        echo "$output" | glow -
+        return
+    fi
+
+    # Otherwise, apply basic color formatting
+    echo "$output" | while IFS= read -r line; do
+        # H2 headers (##)
+        if [[ "$line" =~ ^##[[:space:]](.+)$ ]]; then
+            echo -e "${BLUE}${BOLD}${BASH_REMATCH[1]}${NC}"
+        # H3 headers (###)
+        elif [[ "$line" =~ ^###[[:space:]](.+)$ ]]; then
+            echo -e "${YELLOW}${BOLD}${BASH_REMATCH[1]}${NC}"
+        # Bold text with **
+        elif [[ "$line" =~ \*\*([^\*]+)\*\* ]]; then
+            # Handle REJECT/POLISH/ACCEPT recommendations
+            if [[ "$line" =~ \*\*REJECT\*\* ]]; then
+                echo "$line" | sed -E "s/\*\*REJECT\*\*/${RED}${BOLD}REJECT${NC}/g" | sed -E "s/\*\*([^\*]+)\*\*/${BOLD}\1${NC}/g"
+            elif [[ "$line" =~ \*\*POLISH\*\* ]]; then
+                echo "$line" | sed -E "s/\*\*POLISH\*\*/${YELLOW}${BOLD}POLISH${NC}/g" | sed -E "s/\*\*([^\*]+)\*\*/${BOLD}\1${NC}/g"
+            elif [[ "$line" =~ \*\*ACCEPT\*\* ]]; then
+                echo "$line" | sed -E "s/\*\*ACCEPT\*\*/${GREEN}${BOLD}ACCEPT${NC}/g" | sed -E "s/\*\*([^\*]+)\*\*/${BOLD}\1${NC}/g"
+            else
+                echo "$line" | sed -E "s/\*\*([^\*]+)\*\*/${BOLD}\1${NC}/g"
+            fi
+        # List items
+        elif [[ "$line" =~ ^-[[:space:]] ]]; then
+            echo -e "  ${BLUE}•${NC}${line#-}"
+        else
+            echo "$line"
+        fi
+    done
+}
+
+# Run Claude CLI with the prompt
+print_status "${BLUE}Analyzing changes with Claude...${NC}"
+if [ "$IS_TTY" = true ]; then
+    echo ""
+fi
+
+# Execute claude with the prompt
+CLAUDE_OUTPUT_FILE=$(mktemp)
+trap "rm -f $PROMPT_FILE $CLAUDE_OUTPUT_FILE" EXIT
+
+if [ "$IS_TTY" = true ]; then
+    # Show spinner while Claude is working (TTY only)
+    (claude < "$PROMPT_FILE" > "$CLAUDE_OUTPUT_FILE" 2>&1) &
+    CLAUDE_PID=$!
+    show_spinner $CLAUDE_PID
+    wait $CLAUDE_PID
+    CLAUDE_EXIT_CODE=$?
+else
+    # No spinner when piped - run directly
+    claude < "$PROMPT_FILE" > "$CLAUDE_OUTPUT_FILE" 2>&1
+    CLAUDE_EXIT_CODE=$?
+fi
+
+# Read the output
+CLAUDE_OUTPUT=$(cat "$CLAUDE_OUTPUT_FILE")
+
+if [ $CLAUDE_EXIT_CODE -eq 0 ]; then
+    if [ "$IS_TTY" = true ]; then
+        # Decorative output for terminal
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo ""
+        format_output "$CLAUDE_OUTPUT"
+        echo ""
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        print_status "${GREEN}Review completed successfully${NC}"
+    else
+        # Plain output when piped - just the review content
+        echo "$CLAUDE_OUTPUT"
+    fi
+    exit 0
+else
+    echo -e "${RED}Error running Claude CLI${NC}" >&2
+    echo "$CLAUDE_OUTPUT" >&2
+    exit 1
+fi
