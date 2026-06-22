@@ -4,7 +4,8 @@
 # Removes from ~/.local/bin (no sudo required)
 
 - name: Uninstall claude-review tool
-  hosts: all
+  hosts: localhost
+  connection: local
   vars:
     script_name: claude-review
 

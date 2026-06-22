@@ -4,7 +4,8 @@
 # Installs to ~/.local/bin (no sudo required)
 
 - name: Install claude-review tool
-  hosts: all
+  hosts: localhost
+  connection: local
   vars:
     script_name: claude-review
     # Tmux configuration - customize these before running
